@@ -22,6 +22,7 @@
 
 package pascal.taie.analysis.dataflow.analysis;
 
+import pascal.taie.Assignment;
 import pascal.taie.analysis.MethodAnalysis;
 import pascal.taie.analysis.dataflow.analysis.constprop.CPFact;
 import pascal.taie.analysis.dataflow.analysis.constprop.ConstantPropagation;
@@ -45,8 +46,10 @@ import pascal.taie.ir.stmt.If;
 import pascal.taie.ir.stmt.Stmt;
 import pascal.taie.ir.stmt.SwitchStmt;
 
+import java.util.ArrayDeque;
 import java.util.Comparator;
 import java.util.Set;
+import java.util.HashSet;
 import java.util.TreeSet;
 
 public class DeadCodeDetection extends MethodAnalysis {
@@ -71,6 +74,81 @@ public class DeadCodeDetection extends MethodAnalysis {
         Set<Stmt> deadCode = new TreeSet<>(Comparator.comparing(Stmt::getIndex));
         // TODO - finish me
         // Your task is to recognize dead code in ir and add it to deadCode
+        //按序访问stmt(bfs)
+        ArrayDeque<Stmt> stmts = new ArrayDeque<>();
+        //记录可达的Stmt
+        Set<Stmt> reachable = new HashSet<>();
+        //记录已经访问的Stmt
+        Set<Stmt> visited = new HashSet<>();
+
+        stmts.addLast(cfg.getEntry());  //第一个访问节点为入口
+        //方法的入口与出口必然可达(不考虑因while循环导致不可出的情况)
+        reachable.add(cfg.getEntry());
+        reachable.add(cfg.getExit());
+        //bfs
+        while (!stmts.isEmpty()) {
+            Stmt stmt = stmts.pollFirst();
+            visited.add(stmt);  //已访问到
+            if (stmt instanceof AssignStmt assign) {    //赋值语句, 检查是否为无用赋值
+                //后继语句可直接加入队列
+                for (Stmt succ : cfg.getSuccsOf(stmt)) {
+                    if (!visited.contains(succ)) stmts.addLast(succ);   //防止重复访问
+                }
+
+                //死代码: 左值变量未使用, 且右值无副作用
+                if (!(assign.getLValue() instanceof Var var
+                        && !liveVars.getResult(assign).contains(var)
+                        && hasNoSideEffect(assign.getRValue())))
+                    reachable.add(assign);  //否则, 在可达代码中加入之. 我们未处理由于下一语句不可达而导致本语句也不再live的情况
+            } else if (stmt instanceof If ifStmt) { //if语句处理, 检查是否有不可达分支
+                reachable.add(stmt);    //if语句永远可走到
+                Value eval = ConstantPropagation.evaluate(  //if条件表达式
+                        ifStmt.getCondition(),
+                        constants.getResult(ifStmt));
+                if (!eval.isConstant()) {
+                    for (Stmt succ : cfg.getSuccsOf(stmt)) {
+                        if (!visited.contains(succ)) stmts.addLast(succ);
+                    }
+                } else {    //永远只走true/false一边
+                    Edge.Kind targetKind = eval.getConstant() == 1 ? Edge.Kind.IF_TRUE : Edge.Kind.IF_FALSE;
+                    for (Edge<Stmt> edge : cfg.getOutEdgesOf(stmt)) {
+                        if (edge.getKind() == targetKind && !visited.contains(edge.getTarget()))
+                            stmts.addLast(edge.getTarget());
+                    }
+                }
+            } else if (stmt instanceof SwitchStmt switchStmt) {
+                reachable.add(stmt);
+                Value var = constants.getResult(switchStmt).get(switchStmt.getVar());
+                if (var.isConstant()) { //仅执行常数对应的边
+                    int target = var.getConstant();
+                    boolean matched =  false;   //可能有default分支
+                    for (Edge<Stmt> edge : cfg.getOutEdgesOf(switchStmt)) {
+                        if (edge.getKind() == Edge.Kind.SWITCH_CASE && edge.getCaseValue() == target) {
+                            matched = true;
+                            if (!visited.contains(edge.getTarget())) stmts.addLast(edge.getTarget());
+                        }
+                    }
+                    if (!matched) { //default分支
+                        Stmt defaultStmt = switchStmt.getDefaultTarget();
+                        if (!visited.contains(defaultStmt)) stmts.addLast(defaultStmt);
+                    }
+                } else {    //均可能执行
+                    for (Stmt succ : cfg.getSuccsOf(stmt)) {
+                        if (!visited.contains(succ)) stmts.addLast(succ);
+                    }
+                }
+            } else {    //其它类型语句, 直接可达
+                reachable.add(stmt);
+                for (Stmt succ : cfg.getSuccsOf(stmt)) {
+                    if (!visited.contains(succ)) stmts.addLast(succ);
+                }
+            }
+        }
+
+        for (Stmt stmt : ir.getStmts()) {
+            if (!reachable.contains(stmt)) deadCode.add(stmt);
+        }
+
         return deadCode;
     }
 
